@@ -14,10 +14,12 @@ import argparse
 import sys
 import logging
 import time
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from astroquery.mast import Catalogs, Observations
-from astroquery.gaia import Gaia
+
+# Keep remote-only dependencies lazy.  Offline operations (listing filters and
+# processing a downloaded TIC CSV) should not require the large astroquery stack.
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +30,86 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Column order used by the 125-column bulk TIC CSV downloads.  MAST bulk files
+# commonly omit the header, as does the hackathon input supplied with this repo.
+TIC_COLUMNS = """ID version HIP TYC UCAC TWOMASS SDSS ALLWISE GAIA APASS KIC objType typeSrc ra dec POSflag pmRA e_pmRA pmDEC e_pmDEC PMflag plx e_plx PARflag gallong gallat eclong eclat Bmag e_Bmag Vmag e_Vmag umag e_umag gmag e_gmag rmag e_rmag imag e_imag zmag e_zmag Jmag e_Jmag Hmag e_Hmag Kmag e_Kmag TWOMflag prox w1mag e_w1mag w2mag e_w2mag w3mag e_w3mag w4mag e_w4mag GAIAmag e_GAIAmag Tmag e_Tmag TESSflag SPFlag Teff e_Teff logg e_logg MH e_MH rad e_rad mass e_mass rho e_rho lumclass lum e_lum d e_d ebv e_ebv numcont contratio disposition duplicate_id priority eneg_EBV epos_EBV EBVflag eneg_Mass epos_Mass eneg_Rad epos_Rad eneg_rho epos_rho eneg_logg epos_logg eneg_lum epos_lum eneg_dist epos_dist distflag eneg_Teff epos_Teff TeffFlag gaiabp e_gaiabp gaiarp e_gaiarp gaiaqflag starchareFlag VmagFlag BmagFlag splists e_RA e_Dec RA_orig Dec_orig e_RA_orig e_Dec_orig raddflag wdflag objID""".split()
+
+COMPACT_COLUMNS = [
+    'ID', 'GAIA', 'objType', 'ra', 'dec', 'plx', 'Tmag', 'Teff', 'logg',
+    'MH', 'feh', 'rad', 'mass', 'lum', 'd', 'contratio', 'disposition',
+    'priority', 'ruwe'
+]
+
+
+def _import_mast():
+    try:
+        from astroquery.mast import Catalogs, Observations
+    except ImportError as exc:
+        raise RuntimeError(
+            "Remote queries require astroquery. Install it with "
+            "'python -m pip install astroquery', or use --input-csv."
+        ) from exc
+    return Catalogs, Observations
+
+
+def _import_gaia():
+    try:
+        from astroquery.gaia import Gaia
+    except ImportError as exc:
+        raise RuntimeError(
+            "Gaia enrichment requires astroquery. Install it with "
+            "'python -m pip install astroquery'."
+        ) from exc
+    return Gaia
+
+
+def _tic_csv_kwargs(path: str, compact: bool = False) -> tuple[dict, str]:
+    """Build safe pandas arguments for a headered or standard headerless TIC CSV."""
+    with open(path, 'r', encoding='utf-8-sig') as handle:
+        first_line = handle.readline().strip()
+        first_value = first_line.split(',', 1)[0].strip().upper()
+    has_header = first_value == 'ID'
+    kwargs = {'low_memory': False}
+    if not has_header:
+        kwargs.update(header=None, names=TIC_COLUMNS)
+    if compact:
+        available = first_line.split(',') if has_header else TIC_COLUMNS
+        # Optional fields such as RUWE and feh are retained when present without
+        # making them mandatory for older/headerless TIC bulk exports.
+        kwargs['usecols'] = [column for column in COMPACT_COLUMNS if column in available]
+    return kwargs, 'headered' if has_header else '125-column headerless'
+
+
+def _normalize_catalog_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Expose canonical filter columns while preserving catalog-specific aliases."""
+    if 'MH' not in df.columns and 'feh' in df.columns:
+        df['MH'] = df['feh']
+    return df
+
+
+def read_tic_csv(path: str, compact: bool = False) -> pd.DataFrame:
+    """Read a headered or headerless TIC bulk CSV, optionally with fewer columns."""
+    kwargs, schema = _tic_csv_kwargs(path, compact)
+    started = time.perf_counter()
+    df = pd.read_csv(path, **kwargs)
+    # TIC releases and external stellar catalogs may call metallicity either MH
+    # or feh. Keep the original column and expose MH as the canonical filter name.
+    df = _normalize_catalog_columns(df)
+    logger.info(
+        "Loaded %d TIC rows and %d columns from %s in %.2fs (%s schema).",
+        len(df), len(df.columns), path, time.perf_counter() - started,
+        schema
+    )
+    return df
+
+
+def iter_tic_csv(path: str, compact: bool, chunk_size: int):
+    """Stream a large TIC CSV in bounded-memory DataFrame chunks."""
+    kwargs, schema = _tic_csv_kwargs(path, compact)
+    logger.info("Streaming %s in chunks of %d rows (%s schema).", path, chunk_size, schema)
+    for chunk in pd.read_csv(path, chunksize=chunk_size, **kwargs):
+        yield _normalize_catalog_columns(chunk)
 
 # Metadata defining the 11 pre-sieve filters
 FILTER_METADATA = {
@@ -126,6 +208,7 @@ def fetch_observations_by_sector(sector: int, limit: int = None) -> list:
     """
     logger.info(f"Querying TESS observations for Sector {sector}...")
     try:
+        _, Observations = _import_mast()
         obs_table = Observations.query_criteria(
             project="TESS",
             sequence_number=sector,
@@ -181,6 +264,7 @@ def fetch_tic_properties(tic_ids: list, chunk_size: int = 1000) -> pd.DataFrame:
         pd.DataFrame: DataFrame containing TIC stellar parameters.
     """
     logger.info(f"Querying TIC catalog for stellar properties of {len(tic_ids)} targets in chunks of {chunk_size}...")
+    Catalogs, _ = _import_mast()
     dfs = []
     
     for i, chunk in enumerate(chunk_list(tic_ids, chunk_size)):
@@ -215,6 +299,7 @@ def fetch_gaia_ruwe(gaia_ids: list, chunk_size: int = 1000) -> pd.DataFrame:
     Returns:
         pd.DataFrame: DataFrame with columns 'source_id' and 'ruwe'.
     """
+    Gaia = _import_gaia()
     valid_ids = []
     for gid in gaia_ids:
         if pd.isna(gid):
@@ -379,13 +464,8 @@ def impute_stellar_parameters(df: pd.DataFrame) -> pd.DataFrame:
         emp_cond = df['mass'].isna() & df['rad'].notna()
         if emp_cond.any():
             # Apply piecewise mapping
-            def estimate_mass(r):
-                if r < 1.0:
-                    return r ** 1.25
-                else:
-                    return r ** 1.75
-                    
-            imputed_mass = df.loc[emp_cond, 'rad'].apply(estimate_mass)
+            radii = df.loc[emp_cond, 'rad']
+            imputed_mass = np.where(radii < 1.0, radii ** 1.25, radii ** 1.75)
             df.loc[emp_cond, 'mass'] = imputed_mass
             logger.info(f"Imputed {emp_cond.sum()} mass values using Main-Sequence empirical relations.")
             
@@ -426,6 +506,106 @@ def apply_filters(df: pd.DataFrame, enabled_filters: list) -> pd.DataFrame:
     return filtered_df
 
 
+def categorize_targets(df: pd.DataFrame, enabled_filters: list) -> pd.DataFrame:
+    """Add independent filter flags and labels without intersecting categories."""
+    result = df.copy()
+    flag_columns = []
+    for fkey in enabled_filters:
+        if fkey not in FILTER_METADATA:
+            logger.warning("Filter key '%s' is invalid and will be skipped.", fkey)
+            continue
+        flag = f"is_{fkey}"
+        # Reuse the canonical filter and align its retained indices to the input.
+        retained_index = FILTER_METADATA[fkey]['func'](df).index
+        result[flag] = result.index.isin(retained_index)
+        flag_columns.append(flag)
+        logger.info("Category [%s]: matched %d targets.", fkey, result[flag].sum())
+
+    if flag_columns:
+        flags = result[flag_columns].to_numpy(dtype=bool)
+        names = np.asarray([name.removeprefix('is_') for name in flag_columns])
+        result['selection_count'] = flags.sum(axis=1)
+        result['selection_labels'] = [','.join(names[row]) for row in flags]
+    return result
+
+
+def process_dataframe(df: pd.DataFrame, filters: list, categorize: bool) -> pd.DataFrame:
+    """Run the common cleaning, imputation, and selection stages on one frame."""
+    prepared = impute_stellar_parameters(clean_dataset(df))
+    if categorize:
+        return categorize_targets(prepared, filters)
+    if filters:
+        return apply_filters(prepared, filters)
+    return prepared
+
+
+def process_local_csv(path: str, output: str, compact: bool, chunk_size: int,
+                      filters: list, categorize: bool) -> tuple[int, int]:
+    """Process and export a large local catalog incrementally."""
+    input_rows = output_rows = 0
+    category_totals = {f"is_{name}": 0 for name in filters} if categorize else {}
+    wrote_header = False
+    started = time.perf_counter()
+
+    logger.info("============================================================")
+    logger.info("TESS CATALOG PRE-SIEVE")
+    logger.info("Input:  %s", path)
+    logger.info("Output: %s", output)
+    logger.info("Mode:   %s", "complete catalog columns + analysis" if not compact else "compact analysis columns")
+    logger.info("Each chunk is cleaned first, then categorized independently.")
+    logger.info("A category match is a label; categories are not intersected.")
+    logger.info("============================================================")
+
+    for chunk_number, chunk in enumerate(iter_tic_csv(path, compact, chunk_size), 1):
+        input_rows += len(chunk)
+        if chunk_number == 1:
+            logger.info("Cleaning rules active:")
+            logger.info("  1. Keep rows where objType is STAR")
+            logger.info("  2. Remove rows flagged as duplicate or artifact")
+            logger.info("  3. Require contamination ratio <= 0.10")
+            if 'ruwe' in chunk.columns:
+                logger.info("  4. Require RUWE <= 1.40")
+            else:
+                logger.info("  4. RUWE check skipped: this input has no RUWE column")
+        # Detailed per-filter messages are useful for debugging but overwhelming
+        # for multi-million-row files. The summary below reports the same outcome.
+        previous_level = logger.level
+        logger.setLevel(logging.ERROR)
+        try:
+            result = process_dataframe(chunk, filters, categorize)
+        finally:
+            logger.setLevel(previous_level)
+        output_rows += len(result)
+        for column in category_totals:
+            if column in result:
+                category_totals[column] += int(result[column].sum())
+        result.to_csv(output, mode='w' if not wrote_header else 'a',
+                      header=not wrote_header, index=False)
+        wrote_header = True
+        if chunk_number == 1 or chunk_number % 10 == 0:
+            logger.info(
+                "Progress | rows examined: %12s | passed cleaning: %10s",
+                f"{input_rows:,}", f"{output_rows:,}"
+            )
+    if not wrote_header:
+        pd.DataFrame().to_csv(output, index=False)
+
+    elapsed = time.perf_counter() - started
+    logger.info("============================================================")
+    logger.info("ANALYSIS COMPLETE")
+    logger.info("Rows examined:          %s", f"{input_rows:,}")
+    logger.info("Rows passing cleaning:  %s", f"{output_rows:,}")
+    logger.info("Rows rejected:          %s", f"{input_rows - output_rows:,}")
+    logger.info("Runtime:                %.2f seconds", elapsed)
+    if category_totals:
+        logger.info("Category matches (one star may match several):")
+        for column, count in sorted(category_totals.items(), key=lambda item: item[1], reverse=True):
+            logger.info("  %-30s %s", column.removeprefix('is_'), f"{count:,}")
+    logger.info("Saved analyzed CSV: %s", output)
+    logger.info("============================================================")
+    return input_rows, output_rows
+
+
 def list_available_filters():
     """Print all available filters grouped by category."""
     print("\nAvailable Pre-Sieve Filters:")
@@ -446,50 +626,74 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--sector", type=int, default=1, help="TESS Sector number to query (default: 1)")
+    parser.add_argument("--input-csv", help="Process an existing headered or 125-column headerless TIC CSV; skips MAST/Gaia network queries")
+    parser.add_argument("--compact", action="store_true", help="Output only columns needed for cleaning and pre-sieve selection (fastest)")
+    parser.add_argument("--complete-output", action="store_true", help="Preserve all original CSV columns and append analysis columns")
+    parser.add_argument("--csv-chunk-size", type=int, default=250000, help="Rows per chunk for local CSV streaming (default: 250000)")
     parser.add_argument("--limit", type=int, default=1000, help="Limit number of query targets to prevent API timeouts (default: 1000). Set to 0 for unlimited.")
     parser.add_argument("--chunk-size", type=int, default=1000, help="Chunk size for MAST and Gaia queries (default: 1000)")
     parser.add_argument("--filters", type=str, help="Comma-separated list of filter keys to apply.\nExample: --filters solar_twin,neighborhood_census")
-    parser.add_argument("--all-filters", action="store_true", help="Apply all 11 filters sequentially")
+    parser.add_argument("--all-filters", action="store_true", help="Apply all 11 filters sequentially (intersection)")
+    parser.add_argument("--categorize", action="store_true", help="Add independent boolean flags and labels for selected filters instead of intersecting them")
+    parser.add_argument("--categorize-all", action="store_true", help="Categorize independently with all 11 pre-sieve filters")
     parser.add_argument("--list-filters", action="store_true", help="List all available filters and exit")
-    parser.add_argument("--output", type=str, default="filtered_tic_targets.csv", help="Output CSV filepath (default: filtered_tic_targets.csv)")
+    parser.add_argument("--output", type=str, help="Output CSV path; local inputs default to <input>_analyzed.csv beside the input file")
     
     args = parser.parse_args()
     
     if args.list_filters:
         list_available_filters()
         sys.exit(0)
+
+    if args.compact and args.complete_output:
+        parser.error("Choose either --compact or --complete-output, not both.")
+
+    if args.output is None:
+        if args.input_csv:
+            source = Path(args.input_csv)
+            args.output = str(source.with_name(f"{source.stem}_analyzed.csv"))
+        else:
+            args.output = "filtered_tic_targets.csv"
         
     t_pipeline_start = time.time()
+
+    filters_to_apply = []
+    if args.all_filters or args.categorize_all:
+        filters_to_apply = list(FILTER_METADATA.keys())
+    elif args.filters:
+        filters_to_apply = [f.strip() for f in args.filters.split(",") if f.strip()]
     
-    # 1. Fetch TESS Sector target IDs
-    limit_val = args.limit if args.limit > 0 else None
-    try:
-        tic_ids = fetch_observations_by_sector(args.sector, limit=limit_val)
-    except Exception as e:
-        logger.error(f"Fatal error fetching observations: {e}")
-        sys.exit(1)
-        
-    if not tic_ids:
-        logger.error(f"No TIC targets found for Sector {args.sector}. Exiting.")
-        sys.exit(1)
-        
-    # 2. Fetch TIC stellar parameters
-    df_tic = fetch_tic_properties(tic_ids, chunk_size=args.chunk_size)
-    if df_tic.empty:
-        logger.error("No TIC catalog data retrieved. Exiting.")
-        sys.exit(1)
-        
-    # 3. Fetch Gaia DR3 RUWE metrics
-    gaia_ids = df_tic['GAIA'].dropna().unique().tolist()
-    df_gaia = fetch_gaia_ruwe(gaia_ids, chunk_size=args.chunk_size)
-    
-    # 4. Join TIC and Gaia DR3 RUWE data
-    logger.info("Merging TIC catalog data with Gaia RUWE measurements...")
-    df_tic['GAIA'] = df_tic['GAIA'].astype(float)
-    df_gaia['source_id'] = df_gaia['source_id'].astype(float)
-    
-    merged_df = df_tic.merge(df_gaia, left_on='GAIA', right_on='source_id', how='left')
-    logger.info(f"Merge complete. Data shape: {merged_df.shape}")
+    if args.input_csv:
+        try:
+            process_local_csv(
+                args.input_csv, args.output, args.compact and not args.complete_output, args.csv_chunk_size,
+                filters_to_apply, args.categorize or args.categorize_all
+            )
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            logger.error("Could not read TIC CSV: %s", exc)
+            sys.exit(1)
+        logger.info("Pipeline executed successfully in %.2f seconds!", time.time() - t_pipeline_start)
+        return
+    else:
+        # Remote acquisition path retained for users who do not yet have a TIC CSV.
+        limit_val = args.limit if args.limit > 0 else None
+        try:
+            tic_ids = fetch_observations_by_sector(args.sector, limit=limit_val)
+            if not tic_ids:
+                raise RuntimeError(f"No TIC targets found for Sector {args.sector}.")
+            df_tic = fetch_tic_properties(tic_ids, chunk_size=args.chunk_size)
+            if df_tic.empty:
+                raise RuntimeError("No TIC catalog data retrieved.")
+            df_gaia = fetch_gaia_ruwe(df_tic['GAIA'].dropna().unique().tolist(), args.chunk_size)
+        except Exception as exc:
+            logger.error("Fatal remote query error: %s", exc)
+            sys.exit(1)
+
+        logger.info("Merging TIC catalog data with Gaia RUWE measurements...")
+        # Strings preserve all 64 bits of Gaia source IDs; float conversion does not.
+        df_tic['GAIA'] = df_tic['GAIA'].astype('string')
+        df_gaia['source_id'] = df_gaia['source_id'].astype('string')
+        merged_df = df_tic.merge(df_gaia, left_on='GAIA', right_on='source_id', how='left')
     
     # 5. Clean Dataset
     cleaned_df = clean_dataset(merged_df)
@@ -498,13 +702,9 @@ def main():
     imputed_df = impute_stellar_parameters(cleaned_df)
     
     # 7. Apply Astrophysical Filters
-    filters_to_apply = []
-    if args.all_filters:
-        filters_to_apply = list(FILTER_METADATA.keys())
-    elif args.filters:
-        filters_to_apply = [f.strip() for f in args.filters.split(",") if f.strip()]
-        
-    if filters_to_apply:
+    if args.categorize or args.categorize_all:
+        final_df = categorize_targets(imputed_df, filters_to_apply)
+    elif filters_to_apply:
         final_df = apply_filters(imputed_df, filters_to_apply)
     else:
         logger.info("No filters specified. Skipping step. Exporting cleaned & imputed dataset.")
